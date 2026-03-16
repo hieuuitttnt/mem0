@@ -1,9 +1,18 @@
 import { z } from "zod";
 
+// Accepts a string directly, or an object with a "fact" or "text" key
+// (common malformed shapes from smaller LLMs like llama3.1:8b).
+const factItem = z.union([
+  z.string(),
+  z.object({ fact: z.string() }).transform((o) => o.fact),
+  z.object({ text: z.string() }).transform((o) => o.text),
+]);
+
 // Define Zod schema for fact retrieval output
 export const FactRetrievalSchema = z.object({
   facts: z
-    .array(z.string())
+    .array(factItem)
+    .transform((arr) => arr.filter((s) => s.length > 0))
     .describe("An array of distinct facts extracted from the conversation."),
 });
 
@@ -269,5 +278,9 @@ export function parseMessages(messages: string[]): string {
 }
 
 export function removeCodeBlocks(text: string): string {
-  return text.replace(/```[^`]*```/g, "");
+  // Extract content inside code fences instead of deleting it.
+  // The old regex /```[^`]*```/g replaced the entire block (including
+  // its content) with an empty string, so when an LLM returned JSON
+  // wrapped in ```json ... ``` the actual payload was discarded.
+  return text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, "$1").trim();
 }

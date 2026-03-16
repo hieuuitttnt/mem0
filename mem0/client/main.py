@@ -2,7 +2,7 @@ import hashlib
 import logging
 import os
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import requests
@@ -128,16 +128,18 @@ class MemoryClient:
             raise ValueError(f"Error: {error_message}")
 
     @api_error_handler
-    def add(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
+    def add(self, messages, **kwargs) -> Dict[str, Any]:
         """Add a new memory.
 
         Args:
-            messages: A list of message dictionaries.
+            messages: A list of message dictionaries, a single message dictionary,
+                     or a string. If a string is provided, it will be converted to
+                     a user message.
             **kwargs: Additional parameters such as user_id, agent_id, app_id,
-                      metadata, filters.
+                      metadata, filters, async_mode.
 
         Returns:
-            A dictionary containing the API response.
+            A dictionary containing the API response in v1.1 format.
 
         Raises:
             ValidationError: If the input data is invalid.
@@ -147,19 +149,24 @@ class MemoryClient:
             NetworkError: If network connectivity issues occur.
             MemoryNotFoundError: If the memory doesn't exist (for updates/deletes).
         """
-        kwargs = self._prepare_params(kwargs)
-        if kwargs.get("output_format") != "v1.1":
-            kwargs["output_format"] = "v1.1"
-            warnings.warn(
-                (
-                    "output_format='v1.0' is deprecated therefore setting it to "
-                    "'v1.1' by default. Check out the docs for more information: "
-                    "https://docs.mem0.ai/platform/quickstart#4-1-create-memories"
-                ),
-                DeprecationWarning,
-                stacklevel=2,
+        # Handle different message input formats (align with OSS behavior)
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        elif isinstance(messages, dict):
+            messages = [messages]
+        elif not isinstance(messages, list):
+            raise ValueError(
+                f"messages must be str, dict, or list[dict], got {type(messages).__name__}"
             )
-        kwargs["version"] = "v2"
+
+        kwargs = self._prepare_params(kwargs)
+
+        # Set async_mode to True by default, but allow user override
+        if "async_mode" not in kwargs:
+            kwargs["async_mode"] = True
+
+        # Force v1.1 format for all add operations
+        kwargs["output_format"] = "v1.1"
         payload = self._prepare_payload(messages, kwargs)
         response = self.client.post("/v1/memories/", json=payload)
         response.raise_for_status()
@@ -193,16 +200,15 @@ class MemoryClient:
         return response.json()
 
     @api_error_handler
-    def get_all(self, version: str = "v1", **kwargs) -> List[Dict[str, Any]]:
+    def get_all(self, **kwargs) -> Dict[str, Any]:
         """Retrieve all memories, with optional filtering.
 
         Args:
-            version: The API version to use for the search endpoint.
             **kwargs: Optional parameters for filtering (user_id, agent_id,
-                      app_id, top_k).
+                      app_id, top_k, page, page_size).
 
         Returns:
-            A list of dictionaries containing memories.
+            A dictionary containing memories in v1.1 format: {"results": [...]}
 
         Raises:
             ValidationError: If the input data is invalid.
@@ -213,17 +219,16 @@ class MemoryClient:
             MemoryNotFoundError: If the memory doesn't exist (for updates/deletes).
         """
         params = self._prepare_params(kwargs)
-        if version == "v1":
-            response = self.client.get(f"/{version}/memories/", params=params)
-        elif version == "v2":
-            if "page" in params and "page_size" in params:
-                query_params = {
-                    "page": params.pop("page"),
-                    "page_size": params.pop("page_size"),
-                }
-                response = self.client.post(f"/{version}/memories/", json=params, params=query_params)
-            else:
-                response = self.client.post(f"/{version}/memories/", json=params)
+        params.pop("async_mode", None)
+
+        if "page" in params and "page_size" in params:
+            query_params = {
+                "page": params.pop("page"),
+                "page_size": params.pop("page_size"),
+            }
+            response = self.client.post("/v2/memories/", json=params, params=query_params)
+        else:
+            response = self.client.post("/v2/memories/", json=params)
         response.raise_for_status()
         if "metadata" in kwargs:
             del kwargs["metadata"]
@@ -231,25 +236,29 @@ class MemoryClient:
             "client.get_all",
             self,
             {
-                "api_version": version,
+                "api_version": "v2",
                 "keys": list(kwargs.keys()),
                 "sync_type": "sync",
             },
         )
-        return response.json()
+        result = response.json()
+
+        # Ensure v1.1 format (wrap raw list if needed)
+        if isinstance(result, list):
+            return {"results": result}
+        return result
 
     @api_error_handler
-    def search(self, query: str, version: str = "v1", **kwargs) -> List[Dict[str, Any]]:
+    def search(self, query: str, **kwargs) -> Dict[str, Any]:
         """Search memories based on a query.
 
         Args:
             query: The search query string.
-            version: The API version to use for the search endpoint.
             **kwargs: Additional parameters such as user_id, agent_id, app_id,
                       top_k, filters.
 
         Returns:
-            A list of dictionaries containing search results.
+            A dictionary containing search results in v1.1 format: {"results": [...]}
 
         Raises:
             ValidationError: If the input data is invalid.
@@ -261,8 +270,11 @@ class MemoryClient:
         """
         payload = {"query": query}
         params = self._prepare_params(kwargs)
+        params.pop("async_mode", None)
+
         payload.update(params)
-        response = self.client.post(f"/{version}/memories/search/", json=payload)
+
+        response = self.client.post("/v2/memories/search/", json=payload)
         response.raise_for_status()
         if "metadata" in kwargs:
             del kwargs["metadata"]
@@ -270,12 +282,17 @@ class MemoryClient:
             "client.search",
             self,
             {
-                "api_version": version,
+                "api_version": "v2",
                 "keys": list(kwargs.keys()),
                 "sync_type": "sync",
             },
         )
-        return response.json()
+        result = response.json()
+
+        # Ensure v1.1 format (wrap raw list if needed)
+        if isinstance(result, list):
+            return {"results": result}
+        return result
 
     @api_error_handler
     def update(
@@ -283,29 +300,34 @@ class MemoryClient:
         memory_id: str,
         text: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[Union[int, float, str]] = None,
     ) -> Dict[str, Any]:
         """
         Update a memory by ID.
-        
+
         Args:
             memory_id (str): Memory ID.
             text (str, optional): New content to update the memory with.
             metadata (dict, optional): Metadata to update in the memory.
-            
+            timestamp (int, float, or str, optional): Unix epoch timestamp or ISO 8601 string.
+
         Returns:
             Dict[str, Any]: The response from the server.
-            
+
         Example:
             >>> client.update(memory_id="mem_123", text="Likes to play tennis on weekends")
+            >>> client.update(memory_id="mem_123", timestamp="2025-01-15T12:00:00Z")
         """
-        if text is None and metadata is None:
-            raise ValueError("Either text or metadata must be provided for update.")
+        if text is None and metadata is None and timestamp is None:
+            raise ValueError("At least one of text, metadata, or timestamp must be provided for update.")
 
         payload = {}
         if text is not None:
             payload["text"] = text
         if metadata is not None:
             payload["metadata"] = metadata
+        if timestamp is not None:
+            payload["timestamp"] = timestamp
 
         capture_client_event("client.update", self, {"memory_id": memory_id, "sync_type": "sync"})
         params = self._prepare_params()
@@ -650,6 +672,10 @@ class MemoryClient:
         retrieval_criteria: Optional[List[Dict[str, Any]]] = None,
         enable_graph: Optional[bool] = None,
         version: Optional[str] = None,
+        inclusion_prompt: Optional[str] = None,
+        exclusion_prompt: Optional[str] = None,
+        memory_depth: Optional[str] = None,
+        usecase_setting: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Update the project settings.
 
@@ -659,6 +685,10 @@ class MemoryClient:
             retrieval_criteria: New retrieval criteria for the project
             enable_graph: Enable or disable the graph for the project
             version: Version of the project
+            inclusion_prompt: Inclusion prompt for the project
+            exclusion_prompt: Exclusion prompt for the project
+            memory_depth: Memory depth for the project
+            usecase_setting: Usecase setting for the project
 
         Returns:
             Dictionary containing the API response.
@@ -684,6 +714,10 @@ class MemoryClient:
             and retrieval_criteria is None
             and enable_graph is None
             and version is None
+            and inclusion_prompt is None
+            and exclusion_prompt is None
+            and memory_depth is None
+            and usecase_setting is None
         ):
             raise ValueError(
                 "Currently we only support updating custom_instructions or "
@@ -698,6 +732,10 @@ class MemoryClient:
                 "retrieval_criteria": retrieval_criteria,
                 "enable_graph": enable_graph,
                 "version": version,
+                "inclusion_prompt": inclusion_prompt,
+                "exclusion_prompt": exclusion_prompt,
+                "memory_depth": memory_depth,
+                "usecase_setting": usecase_setting,
             }
         )
         response = self.client.patch(
@@ -714,6 +752,10 @@ class MemoryClient:
                 "retrieval_criteria": retrieval_criteria,
                 "enable_graph": enable_graph,
                 "version": version,
+                "inclusion_prompt": inclusion_prompt,
+                "exclusion_prompt": exclusion_prompt,
+                "memory_depth": memory_depth,
+                "usecase_setting": usecase_setting,
                 "sync_type": "sync",
             },
         )
@@ -1062,20 +1104,25 @@ class AsyncMemoryClient:
         await self.async_client.aclose()
 
     @api_error_handler
-    async def add(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
-        kwargs = self._prepare_params(kwargs)
-        if kwargs.get("output_format") != "v1.1":
-            kwargs["output_format"] = "v1.1"
-            warnings.warn(
-                (
-                    "output_format='v1.0' is deprecated therefore setting it to "
-                    "'v1.1' by default. Check out the docs for more information: "
-                    "https://docs.mem0.ai/platform/quickstart#4-1-create-memories"
-                ),
-                DeprecationWarning,
-                stacklevel=2,
+    async def add(self, messages, **kwargs) -> Dict[str, Any]:
+        # Handle different message input formats (align with OSS behavior)
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        elif isinstance(messages, dict):
+            messages = [messages]
+        elif not isinstance(messages, list):
+            raise ValueError(
+                f"messages must be str, dict, or list[dict], got {type(messages).__name__}"
             )
-        kwargs["version"] = "v2"
+
+        kwargs = self._prepare_params(kwargs)
+
+        # Set async_mode to True by default, but allow user override
+        if "async_mode" not in kwargs:
+            kwargs["async_mode"] = True
+
+        # Force v1.1 format for all add operations
+        kwargs["output_format"] = "v1.1"
         payload = self._prepare_payload(messages, kwargs)
         response = await self.async_client.post("/v1/memories/", json=payload)
         response.raise_for_status()
@@ -1093,19 +1140,18 @@ class AsyncMemoryClient:
         return response.json()
 
     @api_error_handler
-    async def get_all(self, version: str = "v1", **kwargs) -> List[Dict[str, Any]]:
+    async def get_all(self, **kwargs) -> Dict[str, Any]:
         params = self._prepare_params(kwargs)
-        if version == "v1":
-            response = await self.async_client.get(f"/{version}/memories/", params=params)
-        elif version == "v2":
-            if "page" in params and "page_size" in params:
-                query_params = {
-                    "page": params.pop("page"),
-                    "page_size": params.pop("page_size"),
-                }
-                response = await self.async_client.post(f"/{version}/memories/", json=params, params=query_params)
-            else:
-                response = await self.async_client.post(f"/{version}/memories/", json=params)
+        params.pop("async_mode", None)
+
+        if "page" in params and "page_size" in params:
+            query_params = {
+                "page": params.pop("page"),
+                "page_size": params.pop("page_size"),
+            }
+            response = await self.async_client.post("/v2/memories/", json=params, params=query_params)
+        else:
+            response = await self.async_client.post("/v2/memories/", json=params)
         response.raise_for_status()
         if "metadata" in kwargs:
             del kwargs["metadata"]
@@ -1113,18 +1159,27 @@ class AsyncMemoryClient:
             "client.get_all",
             self,
             {
-                "api_version": version,
+                "api_version": "v2",
                 "keys": list(kwargs.keys()),
                 "sync_type": "async",
             },
         )
-        return response.json()
+        result = response.json()
+
+        # Ensure v1.1 format (wrap raw list if needed)
+        if isinstance(result, list):
+            return {"results": result}
+        return result
 
     @api_error_handler
-    async def search(self, query: str, version: str = "v1", **kwargs) -> List[Dict[str, Any]]:
+    async def search(self, query: str, **kwargs) -> Dict[str, Any]:
         payload = {"query": query}
-        payload.update(self._prepare_params(kwargs))
-        response = await self.async_client.post(f"/{version}/memories/search/", json=payload)
+        params = self._prepare_params(kwargs)
+        params.pop("async_mode", None)
+
+        payload.update(params)
+
+        response = await self.async_client.post("/v2/memories/search/", json=payload)
         response.raise_for_status()
         if "metadata" in kwargs:
             del kwargs["metadata"]
@@ -1132,39 +1187,52 @@ class AsyncMemoryClient:
             "client.search",
             self,
             {
-                "api_version": version,
+                "api_version": "v2",
                 "keys": list(kwargs.keys()),
                 "sync_type": "async",
             },
         )
-        return response.json()
+        result = response.json()
+
+        # Ensure v1.1 format (wrap raw list if needed)
+        if isinstance(result, list):
+            return {"results": result}
+        return result
 
     @api_error_handler
     async def update(
-        self, memory_id: str, text: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
+        self,
+        memory_id: str,
+        text: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[Union[int, float, str]] = None,
     ) -> Dict[str, Any]:
         """
         Update a memory by ID asynchronously.
-        
+
         Args:
             memory_id (str): Memory ID.
             text (str, optional): New content to update the memory with.
             metadata (dict, optional): Metadata to update in the memory.
-            
+            timestamp (int, float, or str, optional): Unix epoch timestamp or ISO 8601 string.
+
         Returns:
             Dict[str, Any]: The response from the server.
-            
+
         Example:
             >>> await client.update(memory_id="mem_123", text="Likes to play tennis on weekends")
+            >>> await client.update(memory_id="mem_123", timestamp="2025-01-15T12:00:00Z")
         """
-        if text is None and metadata is None:
-            raise ValueError("Either text or metadata must be provided for update.")
+        if text is None and metadata is None and timestamp is None:
+            raise ValueError("At least one of text, metadata, or timestamp must be provided for update.")
 
         payload = {}
         if text is not None:
             payload["text"] = text
         if metadata is not None:
             payload["metadata"] = metadata
+        if timestamp is not None:
+            payload["timestamp"] = timestamp
 
         capture_client_event("client.update", self, {"memory_id": memory_id, "sync_type": "async"})
         params = self._prepare_params()

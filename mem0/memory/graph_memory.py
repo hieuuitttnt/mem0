@@ -30,10 +30,10 @@ class MemoryGraph:
     def __init__(self, config):
         self.config = config
         self.graph = Neo4jGraph(
-            self.config.graph_store.config.url,
-            self.config.graph_store.config.username,
-            self.config.graph_store.config.password,
-            self.config.graph_store.config.database,
+            url=self.config.graph_store.config.url,
+            username=self.config.graph_store.config.username,
+            password=self.config.graph_store.config.password,
+            database=self.config.graph_store.config.database,
             refresh_schema=False,
             driver_config={"notifications_min_severity": "OFF"},
         )
@@ -70,7 +70,8 @@ class MemoryGraph:
             llm_config = self.config.llm.config
         self.llm = LlmFactory.create(self.llm_provider, llm_config)
         self.user_id = None
-        self.threshold = 0.7
+        # Use threshold from graph_store config, default to 0.7 for backward compatibility
+        self.threshold = self.config.graph_store.threshold if hasattr(self.config.graph_store, 'threshold') else 0.7
 
     def add(self, data, filters):
         """
@@ -576,8 +577,8 @@ class MemoryGraph:
             dest_embedding = self.embedding_model.embed(destination)
 
             # search for the nodes with the closest embeddings
-            source_node_search_result = self._search_source_node(source_embedding, filters, threshold=0.9)
-            destination_node_search_result = self._search_destination_node(dest_embedding, filters, threshold=0.9)
+            source_node_search_result = self._search_source_node(source_embedding, filters, threshold=self.threshold)
+            destination_node_search_result = self._search_destination_node(dest_embedding, filters, threshold=self.threshold)
 
             # TODO: Create a cypher query and common params for all the cases
             if not destination_node_search_result and source_node_search_result:
